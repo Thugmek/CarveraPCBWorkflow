@@ -1,0 +1,4 @@
+output/*
+examples/output/*
+__pycache__
+merged.nc

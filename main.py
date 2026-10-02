@@ -2,22 +2,41 @@ import sys
 from pathlib import Path
 import pcb2gcode_wrapper as pcb2gcode
 
-from PyQt6.QtCore import QObject, QRectF, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import (
+    QObject,
+    QRectF,
+    QRunnable,
+    QSize,
+    Qt,
+    QThread,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QBrush, QColor, QImage, QImageReader, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QLabel,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+
+OUTPUT_DIR = Path("output")
+# SVGs are rasterized once at this size (longest side, px); higher = sharper zoom, slower render
+SVG_RENDER_SIZE = 4000
 
 
 class FilePickerRow(QWidget):
@@ -108,16 +127,164 @@ class ProcessWorker(QObject):
             self.finished.emit()
 
 
+class SvgRenderSignals(QObject):
+    rendered = pyqtSignal(str, QImage)
+
+
+class SvgRenderTask(QRunnable):
+    def __init__(self, path: str, signals: SvgRenderSignals):
+        super().__init__()
+        self.path = path
+        self.signals = signals
+
+    def run(self):
+        reader = QImageReader(self.path)
+        size = reader.size()
+        if size.isValid():
+            reader.setScaledSize(
+                size.scaled(
+                    QSize(SVG_RENDER_SIZE, SVG_RENDER_SIZE),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                )
+            )
+        self.signals.rendered.emit(self.path, reader.read())
+
+
+class ZoomableView(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setBackgroundBrush(QBrush(QColor(80, 80, 80)))
+
+    def wheelEvent(self, event):
+        factor = 1.25 ** (event.angleDelta().y() / 120)
+        self.scale(factor, factor)
+
+    def fit(self):
+        rect = self.scene().itemsBoundingRect()
+        if not rect.isEmpty():
+            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+
+
+class SvgViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cache = {}  # path -> (mtime, QPixmap)
+        self.pending = set()
+        self.signals = SvgRenderSignals()
+        self.signals.rendered.connect(self._on_rendered)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        toolbar = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh)
+        fit_btn = QPushButton("Fit")
+        fit_btn.clicked.connect(lambda: self.view.fit())
+        self.spinner = Spinner(18)
+        self.status_label = QLabel()
+        toolbar.addWidget(refresh_btn)
+        toolbar.addWidget(fit_btn)
+        toolbar.addWidget(self.spinner)
+        toolbar.addWidget(self.status_label)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.file_list = QListWidget()
+        self.file_list.currentTextChanged.connect(self._show)
+
+        self.scene = QGraphicsScene(self)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.scene.addItem(self.pixmap_item)
+        self.view = ZoomableView(self.scene)
+
+        splitter = QSplitter()
+        splitter.addWidget(self.file_list)
+        splitter.addWidget(self.view)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([200, 500])
+        layout.addWidget(splitter)
+
+    def refresh(self):
+        current = self.file_list.currentItem()
+        current_name = current.text() if current else None
+        names = sorted(p.name for p in OUTPUT_DIR.glob("*.svg"))
+
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        self.file_list.addItems(names)
+        self.file_list.blockSignals(False)
+
+        if not names:
+            self.pixmap_item.setPixmap(QPixmap())
+            self.status_label.setText(f"No SVG files in {OUTPUT_DIR}/")
+            return
+        row = names.index(current_name) if current_name in names else 0
+        self.file_list.setCurrentRow(row)
+        self._show(names[row])
+
+    def _show(self, name: str):
+        if not name:
+            return
+        path = str(OUTPUT_DIR / name)
+        try:
+            mtime = Path(path).stat().st_mtime
+        except FileNotFoundError:
+            return
+
+        cached = self.cache.get(path)
+        if cached and cached[0] == mtime:
+            self._display(cached[1])
+            return
+
+        self.pixmap_item.setPixmap(QPixmap())
+        self.status_label.setText(f"Rendering {name}...")
+        self.spinner.start()
+        if path not in self.pending:
+            self.pending.add(path)
+            QThreadPool.globalInstance().start(SvgRenderTask(path, self.signals))
+
+    def _on_rendered(self, path: str, image: QImage):
+        self.pending.discard(path)
+        pixmap = QPixmap.fromImage(image)
+        try:
+            self.cache[path] = (Path(path).stat().st_mtime, pixmap)
+        except FileNotFoundError:
+            pass
+
+        current = self.file_list.currentItem()
+        if current and str(OUTPUT_DIR / current.text()) == path:
+            if image.isNull():
+                self.spinner.stop()
+                self.status_label.setText(f"Failed to render {current.text()}")
+            else:
+                self._display(pixmap)
+
+    def _display(self, pixmap: QPixmap):
+        self.spinner.stop()
+        self.status_label.clear()
+        self.pixmap_item.setPixmap(pixmap)
+        self.scene.setSceneRect(self.pixmap_item.boundingRect())
+        self.view.fit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Carvera PCB Workflow")
-        self.resize(700, 500)
+        self.resize(900, 600)
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
         self.tabs.addTab(self._create_gerber_tab(), "Gerber Files")
+        self.viewer = SvgViewer()
+        self.tabs.addTab(self.viewer, "Results")
+        self.viewer.refresh()
 
     def _create_gerber_tab(self) -> QWidget:
         tab = QWidget()
@@ -183,6 +350,8 @@ class MainWindow(QMainWindow):
         self.process_btn.setEnabled(True)
         if self.status_label.text() == "Processing...":
             self.status_label.setText("Done")
+            self.viewer.refresh()
+            self.tabs.setCurrentWidget(self.viewer)
 
     def on_process_failed(self, message: str):
         self.status_label.setText("Failed")

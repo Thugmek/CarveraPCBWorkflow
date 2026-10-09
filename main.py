@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 import pcb2gcode_wrapper as pcb2gcode
@@ -16,7 +17,9 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QBrush, QColor, QImage, QImageReader, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
     QGraphicsPixmapItem,
+    QGroupBox,
     QGraphicsScene,
     QGraphicsView,
     QLabel,
@@ -25,6 +28,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -35,11 +39,68 @@ from PyQt6.QtWidgets import (
 )
 
 OUTPUT_DIR = Path("output")
+CONFIG_PATH = Path("config.cfg")
 # SVGs are rasterized once at this size (longest side, px); higher = sharper zoom, slower render
 SVG_RENDER_SIZE = 4000
 
+TOOL_DEF_RE = re.compile(r"^T(\d+)\S*?C([\d.]+)")
+TOOL_SELECT_RE = re.compile(r"^T(\d+)$")
+
+
+def format_diameter(d: float) -> str:
+    return f"{d:.3f}".rstrip("0").rstrip(".")
+
+
+def parse_drill_sizes(path: str) -> dict:
+    """Return {diameter_mm: hole_count} from an Excellon drill file."""
+    scale = 1.0
+    tools = {}  # tool number -> diameter in mm
+    counts = {}  # tool number -> hole count
+    current = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip().upper()
+            if line.startswith("INCH") or line == "M72":
+                scale = 25.4
+            elif line.startswith("METRIC") or line == "M71":
+                scale = 1.0
+            elif m := TOOL_DEF_RE.match(line):
+                tools[int(m.group(1))] = float(m.group(2)) * scale
+            elif m := TOOL_SELECT_RE.match(line):
+                current = int(m.group(1))
+            elif current is not None and line[:1] in ("X", "Y"):
+                counts[current] = counts.get(current, 0) + 1
+
+    sizes = {}
+    for tool, diameter in tools.items():
+        d = round(diameter, 3)
+        if d > 0:
+            sizes[d] = sizes.get(d, 0) + counts.get(tool, 0)
+    return sizes
+
+
+def write_drills_available(diameters: list):
+    """Replace (or add / remove when empty) the drills-available line in config.cfg."""
+    lines = CONFIG_PATH.read_text().splitlines()
+    value = ",".join(format_diameter(d) for d in sorted(diameters))
+    new_line = f"drills-available={value}" if diameters else None
+
+    out, replaced = [], False
+    for line in lines:
+        if line.strip().startswith("drills-available="):
+            if new_line and not replaced:
+                out.append(new_line)
+            replaced = True
+        else:
+            out.append(line)
+    if new_line and not replaced:
+        out.append(new_line)
+    CONFIG_PATH.write_text("\n".join(out) + "\n")
+
 
 class FilePickerRow(QWidget):
+    path_changed = pyqtSignal(str)
+
     def __init__(self, label: str, file_filter: str, parent=None):
         super().__init__(parent)
         self.file_filter = file_filter
@@ -50,6 +111,7 @@ class FilePickerRow(QWidget):
         self.path_edit = QLineEdit()
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText(f"Select {label} file...")
+        self.path_edit.textChanged.connect(self.path_changed)
         layout.addWidget(self.path_edit)
 
         browse_btn = QPushButton("Browse...")
@@ -65,6 +127,128 @@ class FilePickerRow(QWidget):
 
     def get_path(self) -> str:
         return self.path_edit.text()
+
+
+class DrillListWidget(QGroupBox):
+    """Checkable list of drill diameters; the enabled ones are written to config.cfg."""
+
+    DIAMETER_ROLE = Qt.ItemDataRole.UserRole
+    COUNT_ROLE = Qt.ItemDataRole.UserRole + 1
+    CUSTOM_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, parent=None):
+        super().__init__("Available Drills", parent)
+        layout = QVBoxLayout(self)
+
+        self.info_label = QLabel("Select a drill file to list its hole sizes.")
+        layout.addWidget(self.info_label)
+
+        self.list = QListWidget()
+        self.list.itemChanged.connect(self._save)
+        self.list.currentItemChanged.connect(self._update_buttons)
+        layout.addWidget(self.list)
+
+        add_row = QHBoxLayout()
+        self.diameter_spin = QDoubleSpinBox()
+        self.diameter_spin.setRange(0.05, 10.0)
+        self.diameter_spin.setDecimals(2)
+        self.diameter_spin.setSingleStep(0.05)
+        self.diameter_spin.setValue(1.0)
+        self.diameter_spin.setSuffix(" mm")
+        add_btn = QPushButton("Add Drill")
+        add_btn.clicked.connect(self._add_custom)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setEnabled(False)
+        self.remove_btn.clicked.connect(self._remove_selected)
+        add_row.addWidget(self.diameter_spin)
+        add_row.addWidget(add_btn)
+        add_row.addWidget(self.remove_btn)
+        add_row.addStretch()
+        layout.addLayout(add_row)
+
+    def load_drill_file(self, path: str):
+        # user-added drills survive loading another drill file
+        custom = [e for e in self._entries() if e[3]]
+        sizes = {}
+        if path:
+            try:
+                sizes = parse_drill_sizes(path)
+            except OSError as e:
+                QMessageBox.warning(self, "Drill file", f"Cannot read drill file:\n{e}")
+        if sizes:
+            self.info_label.setText(
+                f"Found {len(sizes)} hole size(s). Uncheck drills you don't have and add "
+                "the ones you do; holes are rounded to the nearest available drill."
+            )
+        else:
+            self.info_label.setText("Select a drill file to list its hole sizes.")
+
+        entries = [(d, count, True, False) for d, count in sizes.items()]
+        entries += [e for e in custom if e[0] not in sizes]
+        self._rebuild(entries)
+        self._save()
+
+    def _entries(self) -> list:
+        """List of (diameter, hole_count|None, enabled, custom)."""
+        result = []
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            result.append((
+                item.data(self.DIAMETER_ROLE),
+                item.data(self.COUNT_ROLE),
+                item.checkState() == Qt.CheckState.Checked,
+                bool(item.data(self.CUSTOM_ROLE)),
+            ))
+        return result
+
+    def _rebuild(self, entries):
+        self.list.blockSignals(True)
+        self.list.clear()
+        for d, count, enabled, custom in sorted(entries, key=lambda e: e[0]):
+            text = f"{format_diameter(d)} mm"
+            if custom:
+                text += "  (added)"
+            elif count is not None:
+                text += f"  ({count} hole{'' if count == 1 else 's'})"
+            item = QListWidgetItem(text)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            item.setData(self.DIAMETER_ROLE, d)
+            item.setData(self.COUNT_ROLE, count)
+            item.setData(self.CUSTOM_ROLE, custom)
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+        self._update_buttons()
+
+    def _add_custom(self):
+        d = round(self.diameter_spin.value(), 3)
+        entries = self._entries()
+        for i, (ed, count, _, custom) in enumerate(entries):
+            if ed == d:
+                entries[i] = (ed, count, True, custom)  # already listed: just re-enable
+                break
+        else:
+            entries.append((d, None, True, True))
+        self._rebuild(entries)
+        self._save()
+
+    def _remove_selected(self):
+        item = self.list.currentItem()
+        if item and item.data(self.CUSTOM_ROLE):
+            self.list.takeItem(self.list.row(item))
+            self._save()
+
+    def _update_buttons(self, *_):
+        item = self.list.currentItem()
+        self.remove_btn.setEnabled(bool(item and item.data(self.CUSTOM_ROLE)))
+
+    def _save(self, *_):
+        if self.list.count() == 0:
+            return  # nothing loaded yet; keep whatever config.cfg has
+        try:
+            write_drills_available([e[0] for e in self._entries() if e[2]])
+        except OSError as e:
+            QMessageBox.warning(self, "Config", f"Cannot write {CONFIG_PATH}:\n{e}")
 
 
 class Spinner(QWidget):
@@ -309,7 +493,10 @@ class MainWindow(QMainWindow):
         form_layout.addRow("Drill:", self.drill)
 
         outer_layout.addLayout(form_layout)
-        outer_layout.addStretch()
+
+        self.drill_list = DrillListWidget()
+        self.drill.path_changed.connect(self.drill_list.load_drill_file)
+        outer_layout.addWidget(self.drill_list, 1)
 
         process_row = QHBoxLayout()
         self.spinner = Spinner()

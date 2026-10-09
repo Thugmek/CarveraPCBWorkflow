@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import sys
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QGraphicsPixmapItem,
     QGroupBox,
+    QHeaderView,
     QGraphicsScene,
     QGraphicsView,
     QLabel,
@@ -34,6 +36,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -41,6 +45,7 @@ from PyQt6.QtWidgets import (
 
 OUTPUT_DIR = Path("output")
 MERGED_GCODE = Path(pcb2gcode.MERGED_FILE)
+TOOLS_JSON = Path(pcb2gcode.TOOLS_FILE)
 CONFIG_PATH = Path("config.cfg")
 # SVGs are rasterized once at this size (longest side, px); higher = sharper zoom, slower render
 SVG_RENDER_SIZE = 4000
@@ -481,6 +486,59 @@ class SvgViewer(QWidget):
         self.view.fit()
 
 
+class ToolListTab(QWidget):
+    """Tool number -> what to put in the spindle; Carvera only shows the number on tool change."""
+
+    COLUMNS = ["Tool", "Type", "Diameter", "Used in"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        self.status_label = QLabel()
+        layout.addWidget(self.status_label)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(True)
+        font = self.table.font()
+        font.setPointSizeF(font.pointSizeF() * 1.3)
+        self.table.setFont(font)
+        layout.addWidget(self.table)
+
+    def refresh(self):
+        self.table.setRowCount(0)
+        try:
+            tools = json.loads(TOOLS_JSON.read_text())
+        except (OSError, ValueError):
+            self.status_label.setText("No tool list yet, run Process first.")
+            return
+        self.status_label.setText(
+            f"{len(tools)} tool(s). When Carvera asks for a tool number, insert the tool listed here."
+        )
+        for tool in tools:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            number = QTableWidgetItem(f"T{tool['number']}")
+            bold = number.font()
+            bold.setBold(True)
+            number.setFont(bold)
+            values = [
+                number,
+                QTableWidgetItem(tool["type"]),
+                QTableWidgetItem(f"{format_diameter(tool['diameter'])} mm"),
+                QTableWidgetItem(", ".join(tool["operations"])),
+            ]
+            for col, item in enumerate(values):
+                self.table.setItem(row, col, item)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -493,7 +551,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._create_gerber_tab(), "Gerber Files")
         self.viewer = SvgViewer()
         self.tabs.addTab(self.viewer, "Results")
+        self.tool_list = ToolListTab()
+        self.tabs.addTab(self.tool_list, "Tool List")
         self.viewer.refresh()
+        self.tool_list.refresh()
 
     def _create_gerber_tab(self) -> QWidget:
         tab = QWidget()
@@ -567,6 +628,7 @@ class MainWindow(QMainWindow):
         if self.status_label.text() == "Processing...":
             self.status_label.setText("Done")
             self.viewer.refresh()
+            self.tool_list.refresh()
             self.tabs.setCurrentWidget(self.viewer)
 
     def on_process_failed(self, message: str):

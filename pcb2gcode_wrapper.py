@@ -1,3 +1,4 @@
+import json
 import subprocess
 import shutil
 import os
@@ -5,6 +6,7 @@ import re
 
 OUTPUT_DIR = "output"
 MERGED_FILE = os.path.join(OUTPUT_DIR, "merged.nc")
+TOOLS_FILE = os.path.join(OUTPUT_DIR, "tools.json")
 
 PREAMBLE = \
 """
@@ -15,9 +17,11 @@ G94
 G54
 """
 
+# G28: park the machine so the finished board can be removed
 POSTAMBLE = \
 """
 M5
+G28
 """
 
 # Which pcb2gcode output files go into the merged program, in machining order.
@@ -25,8 +29,8 @@ M5
 # diameter share one tool number (e.g. outline cutter and milldrill end mill).
 SINGLE_SIDED_ORDER = [
     ("drill.ngc", "drill"),
-    ("milldrill.ngc", "endmill"),
     ("front.ngc", "vbit"),
+    ("milldrill.ngc", "endmill"),
     ("outline.ngc", "endmill"),
 ]
 DOUBLE_SIDED_ORDER = [
@@ -38,6 +42,15 @@ DOUBLE_SIDED_ORDER = [
 ]
 # Order in which tool numbers are assigned: V-bit 1, outline cutter 2, drills 3, 4, 5...
 TOOL_ASSIGN_ORDER = ["front.ngc", "back.ngc", "outline.ngc", "drill.ngc", "milldrill.ngc"]
+
+CATEGORY_NAMES = {"vbit": "V-bit", "endmill": "End mill", "drill": "Drill"}
+OPERATION_NAMES = {
+    "drill.ngc": "Drilling",
+    "milldrill.ngc": "Milled holes",
+    "front.ngc": "Isolation (front)",
+    "back.ngc": "Isolation (back)",
+    "outline.ngc": "Outline",
+}
 
 MSG_RE = re.compile(r"^\(MSG,\s*(.*?)\s*\)$")
 DIAMETER_RE = re.compile(r"(\d+(?:\.\d+)?)\s*mm")
@@ -112,6 +125,9 @@ def merge_gcode(order, merged_path):
             f.write(f"\n( {name} end )\n\n")
         f.write(POSTAMBLE.strip() + "\n")
 
+    with open(TOOLS_FILE, "w") as f:
+        json.dump(tools.to_list(), f, indent=2)
+
 
 class ToolTable:
     """Assigns project-wide tool numbers to (category, diameter) pairs."""
@@ -119,6 +135,8 @@ class ToolTable:
     def __init__(self):
         self.numbers = {}  # (category, diameter) -> tool number
         self.labels = {}  # tool number -> description
+        self.operations = {}  # tool number -> [operation names, in program order]
+        self.loaded = None  # tool currently in the spindle while patching
 
     def register_file(self, path, category):
         with open(path) as f:
@@ -136,6 +154,22 @@ class ToolTable:
             self.numbers[key] = tool
             self.labels[tool] = f"{category} {key[1]:g}mm"
         return self.numbers[key]
+
+    def mark_used(self, tool, operation):
+        ops = self.operations.setdefault(tool, [])
+        if operation not in ops:
+            ops.append(operation)
+
+    def to_list(self):
+        return [
+            {
+                "number": tool,
+                "type": CATEGORY_NAMES.get(category, category),
+                "diameter": diameter,
+                "operations": self.operations.get(tool, []),
+            }
+            for (category, diameter), tool in sorted(self.numbers.items(), key=lambda kv: kv[1])
+        ]
 
     def describe(self):
         lines = ["( Tools: )"]
@@ -174,7 +208,11 @@ def patch_gcode(path, category, tools):
         if code == "M6":
             if tool is None:
                 raise ValueError(f"{path}: tool change without tool description")
-            out.append(f"M6 T{tool}")
+            # skip a change to the tool that is already in the spindle (e.g. milldrill -> outline)
+            if tool != tools.loaded:
+                out.append(f"M6 T{tool}")
+                tools.loaded = tool
+            tools.mark_used(tool, OPERATION_NAMES.get(os.path.basename(path), os.path.basename(path)))
             continue
         if code == "M3":
             out.append(f"M3 S{speed}" if speed else "M3")

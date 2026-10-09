@@ -1,4 +1,5 @@
 import re
+import shutil
 import sys
 from pathlib import Path
 import pcb2gcode_wrapper as pcb2gcode
@@ -39,6 +40,7 @@ from PyQt6.QtWidgets import (
 )
 
 OUTPUT_DIR = Path("output")
+MERGED_GCODE = Path(pcb2gcode.MERGED_FILE)
 CONFIG_PATH = Path("config.cfg")
 # SVGs are rasterized once at this size (longest side, px); higher = sharper zoom, slower render
 SVG_RENDER_SIZE = 4000
@@ -356,6 +358,7 @@ class SvgViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cache = {}  # path -> (mtime, QPixmap)
+        self.last_export = None
         self.pending = set()
         self.signals = SvgRenderSignals()
         self.signals.rendered.connect(self._on_rendered)
@@ -375,6 +378,9 @@ class SvgViewer(QWidget):
         toolbar.addWidget(self.spinner)
         toolbar.addWidget(self.status_label)
         toolbar.addStretch()
+        self.export_btn = QPushButton("Export G-code...")
+        self.export_btn.clicked.connect(self.export_gcode)
+        toolbar.addWidget(self.export_btn)
         layout.addLayout(toolbar)
 
         self.file_list = QListWidget()
@@ -393,7 +399,26 @@ class SvgViewer(QWidget):
         splitter.setSizes([200, 500])
         layout.addWidget(splitter)
 
+    def export_gcode(self):
+        if not MERGED_GCODE.exists():
+            QMessageBox.warning(self, "Export G-code", f"{MERGED_GCODE} not found, run Process first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export G-code", self.last_export or MERGED_GCODE.name,
+            "G-code (*.nc *.gcode *.ngc);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            shutil.copyfile(MERGED_GCODE, path)
+        except OSError as e:
+            QMessageBox.critical(self, "Export G-code", f"Cannot save {path}:\n{e}")
+            return
+        self.last_export = path
+        self.status_label.setText(f"Exported to {path}")
+
     def refresh(self):
+        self.export_btn.setEnabled(MERGED_GCODE.exists())
         current = self.file_list.currentItem()
         current_name = current.text() if current else None
         names = sorted(p.name for p in OUTPUT_DIR.glob("*.svg"))
@@ -489,6 +514,10 @@ class MainWindow(QMainWindow):
 
         form_layout.addRow("Front Copper:", self.front_copper)
         form_layout.addRow("Bottom Copper:", self.bottom_copper)
+        # double-sided boards are not supported yet
+        self.bottom_copper.setEnabled(False)
+        self.bottom_copper.setToolTip("Double-sided boards are not supported yet")
+        form_layout.labelForField(self.bottom_copper).setEnabled(False)
         form_layout.addRow("Outline:", self.outline)
         form_layout.addRow("Drill:", self.drill)
 
